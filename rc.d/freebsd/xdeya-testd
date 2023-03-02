@@ -1,0 +1,28 @@
+#!/bin/sh
+#
+# $FreeBSD: testd (xdeya), v1.5 2007/09/30 23:10:55 flood Exp 
+#
+# PROVIDE: xdeya
+# REQUIRE: NETWORKING
+#
+# Add the following line to /etc/rc.conf to enable xdeya_testd:
+#
+# xdeya_testd_enable="YES"
+#
+
+xdeya_testd_enable="${xdeya_testd_enable-NO}"
+. /etc/rc.subr
+
+
+name=xdeya_testd
+rcvar=`set_rcvar`
+
+prefix=/home/xdeya-test
+procname=xdeya-testd
+pidfile=/var/run/xdeya/testd.pid
+required_files="${prefix}/redefine.conf"
+command="${prefix}/testd"
+
+load_rc_config ${name}
+
+run_rc_command "$1"

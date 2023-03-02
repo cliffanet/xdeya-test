@@ -1,0 +1,284 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use utf8;
+
+use Clib::Proc qw|script0|;
+use lib ROOT();
+use Clib::Const ':utf8';
+use Clib::Log 'log';
+use Clib::BinProto;
+
+use IO::Socket;
+use IO::Select;
+use JSON::XS;
+
+$SIG{__DIE__} = sub { error('DIE: %s', $_) for @_ };
+
+
+# Загрузка протокола обмена
+my $precv = Clib::BinProto->new(
+    '#',
+    # Приветствие от устр-ва
+    { s => 0x02, code => 'hello' },
+    { s => 0x05, code => 'alive' },
+
+    # request data
+    { s => 0x0a, code => 'request',     pk => 'CNNNTC',     key => 'code,n1,n2,n3,tm,c' },
+    # request logbook
+    { s => 0x31, code => 'getlogbook',  pk => 'NN',         key => 'beg,count' },
+    # request wifilist
+    { s => 0x37, code => 'getwifilist' },
+    # save wifilist
+    { s => 0x41, code => 'savewifilist' },
+    # request trklist
+    { s => 0x51, code => 'gettrklist' },
+    # request track
+    { s => 0x54, code => 'gettrack',    pk => 'NNNTC',      key => 'id,jmpnum,jmpkey,tmbeg,fnum' },
+    # save files
+    { s => 0x5a, code => 'savefiles' },
+);
+my $psend = Clib::BinProto->new(
+    '#',
+    { s => 0x03, code => 'auth',        pk => 'Cn',         key => 'err,autokey' },
+);
+
+# параметры процесса
+Clib::Proc::daemon(
+    pidfile => (c('pidPath')||'.').'/testd.pid',
+    procname => 'xdeya-testd',
+    no => c('nodaemon')
+) || exit -1;
+
+# серверный сокет
+my $sockSrv = IO::Socket::INET->new(
+                    Proto => 'tcp',
+                    LocalPort => c('port'),
+                    Listen => 10,
+                    TimeOut => 4,
+                    Reuse => 1,
+                );
+if (!$sockSrv) {
+    error('Can\'t bind TCP port %s: %s', c('port'), $@);
+    exit -1;
+}
+
+# сигнал прерывания процесса
+Clib::Proc::sigint(sub {
+    $sockSrv->close() if $sockSrv;
+    undef $sockSrv;
+});
+
+log('Starting bind on port %s', c('port'));
+
+# Преподготовка для форка
+my $f = Clib::Proc->forkinit();
+$f->onterm(sub {
+    my %p = @_;
+    debug('Terminated [%d] %s', $p{pid}, $p{ip});
+});
+
+# Основной цикл приёма входящих соединений
+while ($sockSrv) {
+    my $sock = $sockSrv->accept() || next;
+    
+    my $ip = $sock->peerhost();
+    debug('Connect from %s', $ip);
+    
+    # Лимит по одновременным соединениям
+    if (my $cnt = c('client_count')) {
+        if ($f->chldcnt() >= $cnt) {
+            error('client count limit exceed');
+            $sock->shutdown(2);
+            $sock->close();
+            next;
+        }
+    }
+    
+    # форкаемся
+    my $pid = $f->fork(ip => $ip) || return;
+    if ($f->ischld()) {
+        Clib::Log->prefix($pid . ' - ' . $ip);
+        $0 .= ': '.$ip;
+        $sockSrv->close();
+        undef $sockSrv;
+        
+        # клиентский процесс
+        cli_recv($sock);
+        $sock->shutdown(2);
+        $sock->close();
+        last;
+    }
+    else {
+        $sock->close();
+    }
+}
+
+log('Finished');
+
+exit 0;
+
+# =========================================================
+# чтение команд (клиентский обработчик)
+# =========================================================
+sub err { error(@_); return; }
+
+sub snd {
+    my $sock = shift() || return;
+    
+    # Почему-то, если со стороны устройства соединение завершится
+    # раньше намеченного, то соединение не закрывается, хотя
+    # с той стороны close() выполняется.
+    # И со стороны сервера сокет зависает на команде send()
+    my $h = IO::Select->new($sock);
+    $h->can_write(20) || return err('send wait timeout');
+    
+    my $ret = eval { $sock->send($psend->pack(@_)) };
+    $ret || return err('Can\'t send: %s', $@||$!);
+    1;
+}
+
+sub sethnd($$) {
+    my $sock = shift() || return;
+    my $hnd = shift() || return;
+
+    (*$sock)->{hnd} = $hnd;
+}
+
+sub cli_recv {
+    my $sock = shift;
+    my $shnd = IO::Select->new($sock);
+    sethnd($sock, \&hnd_hello); # текущий обработчик команд, он может меняться в процессе
+
+    # сигнал прерывания процесса
+    my $run = 1;
+    Clib::Proc::sigint(sub { undef $run; });
+    
+    # приёмник команд
+    my $data = ''; # бинарный поток команд
+    my @data = (); # распакованный поток команд
+    
+    (*$sock)->{reader} = sub {
+        $data .= $_[0];
+        
+        # распаковка
+        my $p = $precv->unpack($data);
+        if (!$p) {
+            # ошибка распаковки
+            error('proto error: %s', $_) foreach $precv->error();
+            error('proto unknown error') if !$precv->error();
+            return;
+        }
+        
+        push @data, @$p;
+        # Обрабатываем команды
+        while (@data) {
+            my $d = shift @data;
+            my $ok = (*$sock)->{hnd}->($sock, $d);
+            $ok || return err('pkt hnd fail on: %s', $d->{code}); # обработчик вернул ошибку
+            if (!defined((*$sock)->{hnd})) {
+                undef $run;
+                last;
+            }
+        }
+        
+        1;
+    };
+    
+    my $timeout = c('timeout');
+    my $tout = time() + $timeout;
+    while ($run && $sock && $shnd && $shnd->handles()) {
+        if ($tout < time()) {
+            log('client read timeout');
+            last;
+        }
+        
+        my @sock = $shnd->can_read(1);
+        
+        foreach my $s (@sock) {
+            $run || last;
+            my $buf; #  получение из сокета
+            my $r = $s->recv($buf, 1024);
+            if (!defined($r)) {
+                error('sock recv fail: %s', $!);
+                sremove($s);
+                next;
+            }
+            
+            my $err = '';
+            my $ok = (*$s)->{reader}->($buf, $err);
+            if (!$ok) {
+                error('sock reader fail: %s', $err) if $err;
+                undef $run;
+                last;
+            }
+            
+            $tout = time() + $timeout;
+        }
+    }
+    
+    foreach my $s ($shnd->handles()) {
+        $shnd->remove($s);
+        $s->shutdown(2);
+        $s->close();
+        if (my $d = (*$s)->{destroy}) {
+            $d->();
+        }
+    }
+    undef $sock;
+    undef $shnd;
+}
+
+sub json2data {
+    my $json = shift();
+    my $data = eval { JSON::XS->new->utf8->decode($json); };
+    $data || return err('JSON-decode fail: %s', $@);
+    return $data;
+}
+
+sub data2json {
+    my $data = shift();
+    if ((ref($data) ne 'HASH') && (ref($data) ne 'ARRAY')) {
+        return err('JSON-encode fail: data is not HASH and is not ARRAY');
+    }
+    my $json = eval { JSON::XS->new->utf8->pretty(0)->canonical->encode($data); };
+    $json || return err('JSON-encode fail: %s', $@);
+    return $json;
+}
+
+# =========================================================
+#  Приветствие, инициализация
+# =========================================================
+sub hnd_hello {
+    my $sock = shift();
+    my $d = shift();
+    my $lpref = log_prefix('hnd_hello');
+    dumper 'recv' => $d;
+    
+    if ($d->{code} eq 'hello') {
+        snd($sock, auth => { err => 0, autokey => 0 }) || return;
+        sethnd($sock, \&hnd_main);
+    }
+    else {
+        return;
+    }
+    
+    1;
+}
+
+# =========================================================
+#  Основной цикл
+# =========================================================
+sub hnd_main {
+    my $sock = shift();
+    my $d = shift();
+    my $lpref = log_prefix('hnd_main');
+    dumper 'recv' => $d;
+
+    return 1;
+}
+
+#==========================================================
+#================================================== End ===
+#==========================================================
