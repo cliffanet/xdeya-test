@@ -59,6 +59,34 @@ my $psend = Clib::BinProto->new(
                         }
                         qw/toff beg cnp end/) },
     { s => 0x33, code => 'logbookend' },
+
+    # track
+    { s => 0x34, code => 'datatrackbeg',pk=>'        NNT',
+                                                        key => 'jmpnum,jmpkey,dtbeg' },
+    { s => 0x35, code => 'datatrack', pk => 'NnaaiiNNNiiNNC nNNNNNN',
+                        key => join(',', qw/
+                                tmoffset flags state direct alt altspeed
+                                lon lat hspeed heading gpsalt vspeed gpsdage sat
+                                batval
+                                hAcc vAcc sAcc cAcc
+                                millis msave
+                            /)
+                        },
+    { s => 0x36, code => 'datatrackend',pk=>'H',        key => 'chksum' },
+
+    { s => 0x51, code => 'trklistbeg' },
+    { s => 0x52, code => 'trklist',     pk=>'NNNNTNC',  key => 'id,flags,jmpnum,jmpkey,dtbeg,fsize,fnum' },
+    { s => 0x53, code => 'trklistend' },
+    { s => 0x54, code => 'trackbeg',    pk=>'NNNNTNH',  key => 'id,flags,jmpnum,jmpkey,dtbeg,fsize,chksum' },
+    { s => 0x55, code => 'trackdata',   pk => 'NnaaiiNNNiiNNC nNNNNNN',
+                                        key => join(',', qw/
+                                                tmoffset flags state direct alt altspeed
+                                                lon lat hspeed heading gpsalt vspeed gpsdage sat
+                                                batval
+                                                hAcc vAcc sAcc cAcc
+                                                millis msave
+                                            /) },
+    { s => 0x56, code => 'trackend' },
 );
 
 # параметры процесса
@@ -158,14 +186,35 @@ sub snd {
     1;
 }
 
-sub opendata {
-    my $filename = shift();
-
+sub datadir {
     my $dir = c('datadir')
         || return err('Not defined `datadir` const');
     $dir = ROOT() . '/' . $dir if $dir !~ /^\//;
     (-d $dir)
         || return err('`datadir` not exists: %s', $dir);
+    
+    return $dir;
+}
+
+sub datadirlist {
+    my $dir = datadir() || return;
+    
+    my $dh;
+    opendir($dh, $dir)
+        || return err('Can\'t open dir \'%s\': %s', $dir, $!);
+    my $lst = [];
+    while (defined(my $f = readdir $dh)) {
+        next if $f =~ /^\./;
+        push @$lst, $f;
+    }
+    closedir $dh;
+
+    return $lst;
+}
+
+sub opendata {
+    my $filename = shift();
+    my $dir = datadir() || return;
 
     my $file = $dir . '/' . $filename;
 
@@ -418,12 +467,63 @@ sub sendWiFiPass {
 
 }
 
-sub sendTrackList {
+sub opentrack {
+    my $fname = shift;
+    my $v = {};
+    $v->{fnum}  = int($1) if $fname =~ /\.(\d+)$/;
+    $v->{fsize} = -s datadir() . '/' . $fname;
+    $v->{fh}    = opendata($fname) || return;
 
+    my $data = readbin($v->{fh}) || return;
+    my @val = unpack 'VVVVvCCCCC', $data;
+    $v->{$_} = shift(@val) foreach qw/id flags jmpnum jmpkey/;
+    $v->{dtbeg} = sprintf '%d-%02d-%02d %d:%02d:%02d', @val;
+    $v->{chksum} = 0;
+
+    return $v;
+}
+
+sub sendTrackList {
+    snd(trklistbeg => {});
+    {
+        my $flist = datadirlist() || last;
+        @$flist =
+            sort
+            grep { /^track\.\d+$/ }
+            @$flist;
+        foreach my $fname (@$flist) {
+            my $v = opentrack($fname) || next;
+            snd(trklist => $v);
+        }
+    }
+    snd(trklistend => {});
 }
 
 sub sendTrack {
     my ($id, $jmpnum, $jmpkey, $tmbeg, $fnum) = @_;
+        my @f =
+                    qw/
+                        tmoffset flags state direct alt altspeed
+                        lon lat hspeed heading gpsalt vspeed gpsdage sat
+                        _
+                        batval
+                        hAcc vAcc sAcc cAcc
+                        millis msave
+                    /;
+
+    my $v = opentrack(sprintf('track.%02d', $fnum)) || last;
+    snd(trackbeg => $v);
+    {
+        while (!$v->{fh}->eof()) {
+            my $data = readbin($v->{fh}) || last;
+            my @val = unpack 'VvaavvVVVssVVCCvVVVVVV', $data;
+            my %d = ();
+            $d{$_} = shift(@val) foreach @f;
+
+            snd(trackdata => \%d) || last;
+        }
+    }
+    snd(trackend => {});
 }
 
 sub sendFiles {
