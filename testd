@@ -25,7 +25,7 @@ my $precv = Clib::BinProto->new(
     { s => 0x05, code => 'alive' },
 
     # request data
-    { s => 0x0a, code => 'request',     pk => 'CNNNTC',     key => 'code,n1,n2,n3,tm,c' },
+    { s => 0x0a, code => 'request',     pk => 'CNNNTC',     key => 'cmd,n1,n2,n3,tm,c' },
     # request logbook
     { s => 0x31, code => 'getlogbook',  pk => 'NN',         key => 'beg,count' },
     # request wifilist
@@ -42,6 +42,23 @@ my $precv = Clib::BinProto->new(
 my $psend = Clib::BinProto->new(
     '#',
     { s => 0x03, code => 'auth',        pk => 'Cn',         key => 'err,autokey' },
+
+    # logbook
+    { s => 0x31, code => 'logbookbeg',  pk => 'NN',         key => 'beg,count' },
+    { s => 0x32, code => 'logbook',     pk => 'NNT' . ('NnaaiiNNNiiNNC nNNNNNN' x 4), # тут надо поправить - выровнять до NN байт ?
+        key => 'num,key,dt,' . join(',',
+                        map {
+                            my $p=$_.'_';
+                            join ',', map { $p.$_ } qw/
+                                tmoffset flags state direct alt altspeed
+                                lon lat hspeed heading gpsalt vspeed gpsdage sat
+                                batval
+                                hAcc vAcc sAcc cAcc
+                                millis msave
+                            /
+                        }
+                        qw/toff beg cnp end/) },
+    { s => 0x33, code => 'logbookend' },
 );
 
 # параметры процесса
@@ -122,10 +139,12 @@ exit 0;
 # =========================================================
 # чтение команд (клиентский обработчик)
 # =========================================================
+my $sock;
+
 sub err { error(@_); return; }
 
 sub snd {
-    my $sock = shift() || return;
+    #my $sock = shift() || return;
     
     # Почему-то, если со стороны устройства соединение завершится
     # раньше намеченного, то соединение не закрывается, хотя
@@ -139,17 +158,51 @@ sub snd {
     1;
 }
 
-sub sethnd($$) {
-    my $sock = shift() || return;
+sub opendata {
+    my $filename = shift();
+
+    my $dir = c('datadir')
+        || return err('Not defined `datadir` const');
+    $dir = ROOT() . '/' . $dir if $dir !~ /^\//;
+    (-d $dir)
+        || return err('`datadir` not exists: %s', $dir);
+
+    my $file = $dir . '/' . $filename;
+
+    my $fh;
+    open($fh, $file)
+        || return err('Can\'t open file \'%s\': %s', $filename, $!);
+    return $fh;
+}
+
+sub readbin {
+    my $fh = shift();
+    my $d;
+    if ($fh->read($d, 2) != 2) {
+        return err('readbin: can\'t get rec len');
+    }
+    my ($len) = unpack 'v', $d;
+    if ((my $read = $fh->read($d, $len)) != $len) {
+        return err('readbin: can\'t get rec data: need %d, read %d', $len, $read);
+    }
+    if ($fh->read($len, 2) != 2) {
+        return err('readbin: can\'t get rec cksum');
+    }
+
+    return $d;
+}
+
+sub sethnd($) {
+    #my $sock = shift() || return;
     my $hnd = shift() || return;
 
     (*$sock)->{hnd} = $hnd;
 }
 
 sub cli_recv {
-    my $sock = shift;
+    $sock = shift;
     my $shnd = IO::Select->new($sock);
-    sethnd($sock, \&hnd_hello); # текущий обработчик команд, он может меняться в процессе
+    sethnd(\&hnd_hello); # текущий обработчик команд, он может меняться в процессе
 
     # сигнал прерывания процесса
     my $run = 1;
@@ -202,7 +255,8 @@ sub cli_recv {
             my $r = $s->recv($buf, 1024);
             if (!defined($r)) {
                 error('sock recv fail: %s', $!);
-                sremove($s);
+                $shnd->remove($s);
+                close $s;
                 next;
             }
             
@@ -257,8 +311,8 @@ sub hnd_hello {
     dumper 'recv' => $d;
     
     if ($d->{code} eq 'hello') {
-        snd($sock, auth => { err => 0, autokey => 0 }) || return;
-        sethnd($sock, \&hnd_main);
+        snd(auth => { err => 0, autokey => 0 }) || return;
+        sethnd(\&hnd_main);
     }
     else {
         return;
@@ -276,7 +330,112 @@ sub hnd_main {
     my $lpref = log_prefix('hnd_main');
     dumper 'recv' => $d;
 
+    #dumper data => Clib::Const::parse(c('datadir'));
+    if ($d->{code} eq 'request') {
+        if ($d->{cmd} == 0x31) {
+            sendLogBook($d->{n1}, $d->{n2});
+        }
+        elsif ($d->{cmd} == 0x37) {
+            sendWiFiPass();
+        }
+        elsif ($d->{cmd} == 0x51) {
+            sendTrackList();
+        }
+        elsif ($d->{cmd} == 0x54) {
+            sendTrack($d->{n1}, $d->{n2}, $d->{n3}, $d->{tm}, $d->{c});
+        }
+        elsif ($d->{cmd} == 0x5a) {
+            sendFiles();
+        }
+    }
+    elsif ($d->{code} eq 'getlogbook') {
+        sendLogBook($d->{beg}, $d->{count});
+    }
+    elsif ($d->{code} eq 'getwifilist') {
+        sendWiFiPass();
+    }
+    elsif ($d->{code} eq 'savewifilist') {
+        recvWiFiPass();
+    }
+    elsif ($d->{code} eq 'gettrklist') {
+        sendTrackList();
+    }
+    elsif ($d->{code} eq 'gettrack') {
+        sendTrack($d->{id}, $d->{jmpnum}, $d->{jmpkey}, $d->{tmbeg}, $d->{fnum});
+    }
+    elsif ($d->{code} eq 'savefiles') {
+        recvFiles();
+    }
+
     return 1;
+}
+
+sub sendLogBook {
+    my ($beg, $count) = @_;
+
+    snd(logbookbeg => { beg => $beg, count => $count });
+    {
+        my $fh = opendata('logsimple.01') || last;
+        my %v = ();
+        my @var =
+            map { \$v{$_} }
+            (
+                qw/num key dt_year dt_mon dt_day dt_h dt_m dt_s dt_tick/,
+                map {
+                    my $p=$_.'_';
+                    map { $p.$_ } qw/
+                        tmoffset flags state direct alt altspeed
+                        lon lat hspeed heading gpsalt vspeed gpsdage sat
+                        _
+                        batval
+                        hAcc vAcc sAcc cAcc
+                        millis msave
+                    /
+                }
+                qw/toff beg cnp end/
+            );
+
+        while (!$fh->eof()) {
+            my $data = readbin($fh) || last;
+            # net:           'NNT'       . ('NnaaiiNNNiiNNC nNNNNNN' x 4)
+            my @val = unpack 'VVvCCCCCC' . ('VvaavvVVVssVVCCvVVVVVV' x 4), $data;
+            #dumper val => \@val;
+            $$_ = shift(@val) foreach @var;
+            my %v1 = %v;
+            my @dt = map { delete $v1{'dt_'.$_} } qw/year mon day h m s tick/;
+            pop @dt;
+            $v1{dt} = sprintf '%d-%02d-%02d %d:%02d:%02d', @dt;
+            #dumper v => \%v1;
+            snd(logbook => \%v1);
+        }
+
+        close $fh;
+    }
+    snd(logbookend => {});
+}
+
+sub sendWiFiPass {
+
+}
+
+sub sendTrackList {
+
+}
+
+sub sendTrack {
+    my ($id, $jmpnum, $jmpkey, $tmbeg, $fnum) = @_;
+}
+
+sub sendFiles {
+
+}
+
+sub recvWiFiPass {
+
+}
+
+sub recvFiles {
+
 }
 
 #==========================================================

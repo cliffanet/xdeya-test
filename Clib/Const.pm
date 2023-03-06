@@ -199,6 +199,10 @@ sub load_file {
         $error = 'Can\'t read const file \''.$file.'\': ' . $@;
         return;
     }
+
+    if ($INC{'Clib/Proc.pm'} && (my $root = Clib::Proc::ROOT())) {
+        unshift @c, ROOT => $root;
+    }
     
     my $const = ($const{$namespace} ||= {});
     if (defined $key) {
